@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>NEON ORB RUSH — one prompt, one game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05010d; height: 100%; overflow: hidden; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { touch-action: none; display: block; background: #05010d;
+    box-shadow: 0 0 60px rgba(255, 0, 170, .25), 0 0 120px rgba(0, 229, 255, .15); }
+  #hint { position: fixed; left: 0; right: 0; bottom: 10px; text-align: center;
+    color: #8a7fa8; font: 13px/1.4 system-ui, sans-serif; letter-spacing: .04em;
+    pointer-events: none; user-select: none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="540"></canvas></div>
+<div id="hint">← → / A D or mouse to move &nbsp;·&nbsp; SPACE dash &nbsp;·&nbsp; catch orbs, dodge bombs &nbsp;·&nbsp; combo ×8 = OVERDRIVE</div>
+<script>
+"use strict";
+/* NEON ORB RUSH — a tiny neon arcade catcher.
+   One verb: catch the glowing orbs, dodge the red bombs.
+   Twist — COMBO / OVERDRIVE: every catch in a row raises your multiplier
+   (x1 → x8). At combo 8 OVERDRIVE kicks in: double points, faster falls,
+   screen pulses — big points, real risk. One miss or bomb resets it. */
+const W = 960, H = 540;
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const params = new URLSearchParams(location.search);
+const DEMO = params.get("demo") === "1";
+if (DEMO) document.getElementById("hint").style.display = "none";
+
+// DPR-aware backing store, logical 960x540 coordinates.
+function fit() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const scale = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.96;
+  canvas.style.width = Math.floor(W * scale) + "px";
+  canvas.style.height = Math.floor(H * scale) + "px";
+  canvas.width = Math.floor(W * scale * dpr);
+  canvas.height = Math.floor(H * scale * dpr);
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+}
+window.addEventListener("resize", fit);
+fit();
+
+// --- audio: tiny WebAudio bleeps, unlocked on first gesture ---
+let audio = null;
+function ensureAudio() {
+  if (!audio) { try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audio = null; } }
+  if (audio && audio.state === "suspended") audio.resume();
+}
+function blip(freq, dur, type, vol) {
+  if (!audio || audio.state !== "running") return;
+  try {
+    const o = audio.createOscillator(), g = audio.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.12, audio.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + dur);
+    o.connect(g); g.connect(audio.destination);
+    o.start(); o.stop(audio.currentTime + dur);
+  } catch (e) { /* audio is decoration, never fatal */ }
+}
+
+// --- state ---
+const STATE = { TITLE: 0, PLAYING: 1, OVER: 2 };
+let scene = STATE.TITLE;
+let score = 0, best = 0, lives = 3, combo = 0, overdrive = false;
+let overdriveT = 0, spawnT = 0, elapsed = 0, shake = 0, flash = 0;
+let orbs = [], parts = [], stars = [];
+try { best = parseInt(localStorage.getItem("neon-orb-rush-best") || "0", 10) || 0; } catch (e) { best = 0; }
+function saveBest() { try { localStorage.setItem("neon-orb-rush-best", String(best)); } catch (e) { /* ignore */ } }
+
+const paddle = { x: W / 2, y: H - 46, w: 120, h: 16, vx: 0, dash: 0, dashCd: 0 };
+const keys = {};
+for (let i = 0; i < 90; i++) stars.push({ x: Math.random() * W, y: Math.random() * H, s: Math.random() * 1.8 + 0.4, tw: Math.random() * 6.28 });
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+function spawnOrb() {
+  const r = Math.random();
+  const bomb = r < 0.22;                       // 22% bombs
+  const gold = !bomb && r > 0.93;               // rare golden orb
+  orbs.push({
+    x: rand(30, W - 30), y: -20,
+    vy: rand(150, 230) * (overdrive ? 1.35 : 1) * (1 + elapsed / 90),
+    vx: rand(-30, 30), r: gold ? 16 : (bomb ? 14 : 12),
+    kind: bomb ? "bomb" : (gold ? "gold" : "orb"),
+    hue: bomb ? 0 : (gold ? 48 : (Math.random() < 0.5 ? 185 : 310)),
+    rot: rand(0, 6.28), spin: rand(-2, 2)
+  });
+}
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.28, sp = rand(60, 320);
+    parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60, life: rand(0.3, 0.7), max: 0.7, color, r: rand(2, 5) });
+  }
+}
+function startGame() {
+  ensureAudio();
+  score = 0; lives = 3; combo = 0; overdrive = false; overdriveT = 0;
+  orbs = []; parts = []; elapsed = 0; spawnT = 0;
+  paddle.x = W / 2; paddle.dash = 0; paddle.dashCd = 0;
+  scene = STATE.PLAYING;
+}
+function gameOver() {
+  scene = STATE.OVER;
+  if (score > best) { best = score; saveBest(); }
+  blip(110, 0.5, "sawtooth", 0.15);
+}
+
+// --- input: keyboard + mouse/touch ---
+window.addEventListener("keydown", (e) => {
+  if (["ArrowLeft", "ArrowRight", "Space"].includes(e.code)) e.preventDefault();
+  keys[e.code] = true; ensureAudio();
+  if (e.code === "Space" && scene === STATE.PLAYING && paddle.dashCd <= 0) {
+    paddle.dash = 0.22; paddle.dashCd = 3; blip(880, 0.12, "square", 0.08);
+  }
+  if ((e.code === "Enter" || e.code === "Space") && scene !== STATE.PLAYING) startGame();
+});
+window.addEventListener("keyup", (e) => { keys[e.code] = false; });
+function pointerMove(clientX) {
+  const rect = canvas.getBoundingClientRect();
+  paddle.x = (clientX - rect.left) / rect.width * W;
+  ensureAudio();
+}
+canvas.addEventListener("pointermove", (e) => { if (scene === STATE.PLAYING) pointerMove(e.clientX); });
+canvas.addEventListener("pointerdown", (e) => {
+  ensureAudio();
+  if (scene !== STATE.PLAYING) startGame(); else pointerMove(e.clientX);
+});
+
+// --- autopilot (demo mode): plays itself so footage can be captured headless ---
+function autopilot(dt) {
+  let target = null, bestY = -1e9;
+  for (const o of orbs) { if (o.kind !== "bomb" && o.y > bestY) { bestY = o.y; target = o; } }
+  if (target) {
+    const dx = target.x - paddle.x;
+    paddle.x += Math.max(-520 * dt, Math.min(520 * dt, dx));
+    // dash away if a bomb is about to land on us
+    for (const o of orbs) {
+      if (o.kind === "bomb" && Math.abs(o.x - paddle.x) < 70 && o.y > paddle.y - 130 && paddle.dashCd <= 0) {
+        paddle.dash = 0.22; paddle.dashCd = 3;
+      }
+    }
+  }
+}
+
+// --- update: fixed-ish step, dt clamped (tab-return safe) ---
+let last = performance.now();
+function update(now) {
+  let dt = Math.min((now - last) / 1000, 0.05); last = now;
+  if (scene === STATE.PLAYING) {
+    elapsed += dt;
+    if (paddle.dash > 0) paddle.dash -= dt;
+    if (paddle.dashCd > 0) paddle.dashCd -= dt;
+    const speed = (paddle.dash > 0 ? 900 : 460);
+    if (keys.ArrowLeft || keys.KeyA) paddle.x -= speed * dt;
+    if (keys.ArrowRight || keys.KeyD) paddle.x += speed * dt;
+    if (DEMO) autopilot(dt);
+    paddle.x = Math.max(paddle.w / 2, Math.min(W - paddle.w / 2, paddle.x));
+
+    spawnT -= dt;
+    if (spawnT <= 0) { spawnOrb(); spawnT = rand(0.28, 0.55) / (1 + elapsed / 90); }
+    if (overdrive) { overdriveT -= dt; if (overdriveT <= 0) { overdrive = false; } }
+
+    for (let i = orbs.length - 1; i >= 0; i--) {
+      const o = orbs[i];
+      o.y += o.vy * dt; o.x += o.vx * dt; o.rot += o.spin * dt;
+      if (o.x < o.r || o.x > W - o.r) o.vx *= -1;
+      const hit = o.y + o.r >= paddle.y - paddle.h / 2 && o.y - o.r <= paddle.y + paddle.h / 2
+        && Math.abs(o.x - paddle.x) <= paddle.w / 2 + o.r * 0.6;
+      if (hit) {
+        if (o.kind === "bomb") {
+          lives--; combo = 0; overdrive = false; shake = 14; flash = 0.35;
+          burst(o.x, o.y, "#ff2a55", 26); blip(90, 0.35, "sawtooth", 0.18);
+          if (lives <= 0) gameOver();
+        } else {
+          combo++;
+          const mult = Math.min(combo, 8);
+          const pts = (o.kind === "gold" ? 50 : 10) * mult * (overdrive ? 2 : 1);
+          score += pts;
+          burst(o.x, o.y, o.kind === "gold" ? "#ffd94d" : "#00e5ff", o.kind === "gold" ? 22 : 12);
+          blip(520 + Math.min(combo, 12) * 45, 0.12, "sine", 0.12);
+          if (combo >= 8 && !overdrive) { overdrive = true; overdriveT = 6; blip(1200, 0.3, "square", 0.1); }
+        }
+        orbs.splice(i, 1);
+      } else if (o.y - o.r > H) {
+        if (o.kind !== "bomb") { combo = 0; overdrive = false; } // dropped orb breaks the combo
+        orbs.splice(i, 1);
+      }
+    }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt; p.life -= dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 40);
+  if (flash > 0) flash = Math.max(0, flash - dt * 1.4);
+}
+
+// --- pre-rendered glow sprites: gradients per orb per frame were the
+// perf bottleneck (weak VM, 1920x1080 canvas). Draw once, blit forever. ---
+function makeSprite(color, r, drawCore) {
+  const S = Math.ceil(r * 2.2) * 2 + 8;
+  const c = document.createElement("canvas"); c.width = c.height = S;
+  const g = c.getContext("2d"), cx = S / 2, cy = S / 2;
+  const grad = g.createRadialGradient(cx, cy, 0, cx, cy, r * 2.2);
+  grad.addColorStop(0, color); grad.addColorStop(0.4, color + "cc"); grad.addColorStop(1, color + "00");
+  g.fillStyle = grad; g.beginPath(); g.arc(cx, cy, r * 2.2, 0, 6.29); g.fill();
+  drawCore(g, cx, cy, r);
+  return { canvas: c, half: S / 2 };
+}
+const SPRITES = {
+  cyan: makeSprite("#00e5ff", 12, (g, x, y, r) => { g.fillStyle = "#00e5ff"; g.beginPath(); g.arc(x, y, r, 0, 6.29); g.fill(); g.fillStyle = "rgba(255,255,255,0.85)"; g.beginPath(); g.arc(x - r * 0.3, y - r * 0.3, r * 0.28, 0, 6.29); g.fill(); }),
+  magenta: makeSprite("#ff2ea6", 12, (g, x, y, r) => { g.fillStyle = "#ff2ea6"; g.beginPath(); g.arc(x, y, r, 0, 6.29); g.fill(); g.fillStyle = "rgba(255,255,255,0.85)"; g.beginPath(); g.arc(x - r * 0.3, y - r * 0.3, r * 0.28, 0, 6.29); g.fill(); }),
+  gold: makeSprite("#ffd94d", 16, (g, x, y, r) => { g.fillStyle = "#ffd94d"; g.beginPath(); g.arc(x, y, r, 0, 6.29); g.fill(); g.fillStyle = "rgba(255,255,255,0.85)"; g.beginPath(); g.arc(x - r * 0.3, y - r * 0.3, r * 0.28, 0, 6.29); g.fill(); }),
+  bomb: makeSprite("#ff2a55", 14, (g, x, y, r) => {
+    g.fillStyle = "#ff2a55"; g.beginPath();
+    for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4, rr = k % 2 ? r * 0.55 : r; g.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr); }
+    g.closePath(); g.fill();
+    g.fillStyle = "#05010d"; g.beginPath(); g.arc(x, y, r * 0.35, 0, 6.29); g.fill();
+  }),
+};
+const PADDLE_GLOW = (() => {
+  const c = document.createElement("canvas"); c.width = 260; c.height = 90;
+  const g = c.getContext("2d");
+  const grad = g.createRadialGradient(130, 45, 4, 130, 45, 120);
+  grad.addColorStop(0, "rgba(0,229,255,0.55)"); grad.addColorStop(1, "rgba(0,229,255,0)");
+  g.fillStyle = grad; g.fillRect(0, 0, 260, 90);
+  return c;
+})();
+function draw(now) {
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-shake, shake) * 0.5, rand(-shake, shake) * 0.5);
+  // background (cached gradient)
+  if (!draw._bg) {
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, "#0a0220"); bg.addColorStop(0.6, "#05010d"); bg.addColorStop(1, "#160024");
+    draw._bg = bg;
+  }
+  ctx.fillStyle = draw._bg; ctx.fillRect(-20, -20, W + 40, H + 40);
+  for (const s of stars) {
+    ctx.globalAlpha = 0.25 + 0.55 * Math.abs(Math.sin(now / 900 + s.tw));
+    ctx.fillStyle = "#bfe9ff"; ctx.fillRect(s.x, s.y, s.s, s.s);
+  }
+  ctx.globalAlpha = 1;
+  // side rails
+  ctx.fillStyle = "rgba(0,229,255,0.12)"; ctx.fillRect(0, 0, 4, H); ctx.fillRect(W - 4, 0, 4, H);
+
+  if (scene === STATE.TITLE) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#00e5ff"; ctx.font = "bold 64px system-ui, sans-serif";
+    ctx.fillText("NEON ORB RUSH", W / 2, 170);
+    ctx.fillStyle = "#ff2ea6"; ctx.font = "bold 26px system-ui, sans-serif";
+    ctx.fillText("one prompt · one game · built by an AI agent", W / 2, 218);
+    ctx.fillStyle = "#e8e2ff"; ctx.font = "20px system-ui, sans-serif";
+    ctx.fillText("Catch the orbs. Dodge the bombs.", W / 2, 280);
+    ctx.fillStyle = "#ffd94d"; ctx.font = "bold 20px system-ui, sans-serif";
+    ctx.fillText("Combo x8 = OVERDRIVE: double points, double danger", W / 2, 314);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 24px system-ui, sans-serif";
+    const pulse = 0.6 + 0.4 * Math.sin(now / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText(DEMO ? "DEMO MODE — autopilot playing" : "Press ENTER / SPACE or click to play", W / 2, 400);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#8a7fa8"; ctx.font = "16px system-ui, sans-serif";
+    ctx.fillText("← → / A D or mouse · SPACE dash · best " + best, W / 2, 440);
+  } else {
+    // orbs (pre-rendered sprites, rotated only for bombs)
+    for (const o of orbs) {
+      const spr = o.kind === "bomb" ? SPRITES.bomb : (o.kind === "gold" ? SPRITES.gold : (o.hue === 185 ? SPRITES.cyan : SPRITES.magenta));
+      if (o.kind === "bomb") {
+        ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.rot);
+        ctx.drawImage(spr.canvas, -spr.half, -spr.half);
+        ctx.restore();
+      } else {
+        ctx.drawImage(spr.canvas, o.x - spr.half, o.y - spr.half);
+      }
+    }
+    // particles
+    for (const p of parts) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // paddle (one small gradient per frame is cheap; it must track paddle.x)
+    const pw = paddle.w + (paddle.dash > 0 ? 26 : 0);
+    const pg = ctx.createLinearGradient(paddle.x - pw / 2, 0, paddle.x + pw / 2, 0);
+    pg.addColorStop(0, "#00e5ff"); pg.addColorStop(0.5, "#ffffff"); pg.addColorStop(1, "#ff2ea6");
+    ctx.drawImage(PADDLE_GLOW, paddle.x - 130, paddle.y - 45);
+    ctx.fillStyle = pg;
+    ctx.beginPath();
+    ctx.roundRect(paddle.x - pw / 2, paddle.y - paddle.h / 2, pw, paddle.h, 8);
+    ctx.fill();
+    if (paddle.dashCd > 0) {
+      ctx.fillStyle = "rgba(255,255,255,0.25)";
+      ctx.fillRect(paddle.x - pw / 2, paddle.y + paddle.h / 2 + 5, pw * (1 - paddle.dashCd / 3), 3);
+    }
+    // HUD
+    ctx.textAlign = "left"; ctx.fillStyle = "#ffffff"; ctx.font = "bold 28px system-ui, sans-serif";
+    ctx.fillText("SCORE " + score, 18, 40);
+    ctx.textAlign = "center";
+    ctx.fillStyle = overdrive ? "#ffd94d" : (combo >= 4 ? "#ff2ea6" : "#8a7fa8");
+    ctx.font = "bold 28px system-ui, sans-serif";
+    ctx.fillText(overdrive ? "⚡ OVERDRIVE x" + Math.min(combo, 8) * 2 + " ⚡" : "COMBO x" + Math.min(combo, 8), W / 2, 40);
+    ctx.textAlign = "right"; ctx.fillStyle = "#ffffff";
+    ctx.fillText("♥".repeat(Math.max(0, lives)) + "  BEST " + best, W - 18, 40);
+    if (overdrive) {
+      ctx.fillStyle = "rgba(255,217,77,0.08)";
+      ctx.fillRect(0, 0, W, H);
+    }
+    if (scene === STATE.OVER) {
+      ctx.fillStyle = "rgba(5,1,13,0.72)"; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ff2a55"; ctx.font = "bold 56px system-ui, sans-serif";
+      ctx.fillText("GAME OVER", W / 2, 220);
+      ctx.fillStyle = "#ffffff"; ctx.font = "bold 30px system-ui, sans-serif";
+      ctx.fillText("Score " + score + "   ·   Best " + best, W / 2, 280);
+      ctx.fillStyle = "#00e5ff"; ctx.font = "22px system-ui, sans-serif";
+      ctx.fillText("Press ENTER to play again", W / 2, 330);
+    }
+  }
+  if (flash > 0) { ctx.fillStyle = "rgba(255,42,85," + (flash * 0.5) + ")"; ctx.fillRect(0, 0, W, H); }
+  ctx.restore();
+}
+function loop(now) { update(now); draw(now); requestAnimationFrame(loop); }
+if (DEMO) { startGame(); }
+// Read-only debug hook so headless checks can prove the game really plays.
+window.__orbRush = {
+  get score() { return score; }, get combo() { return combo; },
+  get lives() { return lives; }, get scene() { return scene; },
+  get orbs() { return orbs.length; }
+};
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
